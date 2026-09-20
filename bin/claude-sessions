@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""claude-sessions — bring every named Claude Code session back after a reboot.
+
+The registry (~/.claude/resume/sessions/<id>.json) is maintained by the
+SessionStart / UserPromptSubmit / SessionEnd hooks in
+hooks/session-registry.sh. A session stays registered until it is deliberately
+exited (/exit, Ctrl-D, /clear); a closed tab, a quit terminal or a reboot
+leaves it in place so `resume` brings it back.
+
+Commands
+  resume     open one tab per registered session that is not already running,
+             running `cd <cwd> && claude --resume <id>` in each (default)
+  list       show the registry with running / closed status
+  snapshot   seed the registry from the sessions running right now (for
+             sessions that started before the hooks were installed)
+  forget X   drop entries by name or session-id prefix
+  prune      drop entries whose transcript or directory no longer exists
+
+Options for resume
+  --dry-run          print what would be opened, open nothing
+  --at-login         wait for the desktop to settle and retry (LaunchAgent)
+  --new-window       open in a new window instead of the current one
+  --terminal NAME    iterm2 | terminal  (default: auto-detect)
+
+Environment
+  CLAUDE_RESUME_DIR  registry location (default ~/.claude/resume)
+  CLAUDE_SESSIONS_TERMINAL  same as --terminal
+"""
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+RESUME_DIR = Path(os.environ.get("CLAUDE_RESUME_DIR", HOME / ".claude" / "resume"))
+REG_DIR = RESUME_DIR / "sessions"
+LIVE_DIR = HOME / ".claude" / "sessions"
+LOG = RESUME_DIR / "resume.log"
+
+
+# ----------------------------------------------------------------- registry
+
+def load_registry():
+    out = []
+    for f in sorted(REG_DIR.glob("*.json")):
+        try:
+            d = json.loads(f.read_text())
+            if d.get("session_id"):
+                out.append(d)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def write_entry(d):
+    REG_DIR.mkdir(parents=True, exist_ok=True)
+    p = REG_DIR / (d["session_id"] + ".json")
+    tmp = p.with_suffix(".tmp.%d" % os.getpid())
+    tmp.write_text(json.dumps(d, separators=(",", ":")))
+    os.replace(tmp, p)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def live_sessions():
+    """session_id -> Claude's own live entry, for interactive CLI sessions whose
+    process is actually alive. Claude writes these to ~/.claude/sessions/<pid>.json
+    and removes them on exit; a crash can leave a stale one, hence the liveness
+    check. This file does not survive a reboot — that is why we keep our own."""
+    out = {}
+    for f in LIVE_DIR.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if d.get("kind") != "interactive" or d.get("entrypoint") != "cli":
+            continue
+        if not pid_alive(d.get("pid")):
+            continue
+        sid = d.get("sessionId")
+        if sid:
+            out[sid] = d
+    return out
+
+
+def natural_key(entry):
+    """Sort SHE-T2 before SHE-T10; unnamed sessions last."""
+    name = entry.get("name") or ""
+    if not name:
+        return (1, [], entry.get("first_seen") or "")
+    parts = [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", name)]
+    return (0, parts, "")
+
+
+def resumable(entry):
+    cwd = entry.get("cwd") or ""
+    tp = entry.get("transcript_path") or ""
+    if not cwd or not os.path.isdir(cwd):
+        return False, "directory missing: %s" % (cwd or "?")
+    if tp and not os.path.isfile(tp):
+        return False, "transcript missing: %s" % tp
+    return True, ""
+
+
+def label(entry):
+    return entry.get("name") or "(unnamed %s)" % entry["session_id"][:8]
+
+
+def log(msg):
+    line = "%s %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+    print(line, flush=True)
+    try:
+        RESUME_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ terminal
+
+def osascript(script, timeout=60):
+    r = subprocess.run(["/usr/bin/osascript", "-"], input=script, text=True,
+                       capture_output=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "osascript exit %d" % r.returncode)
+    return r.stdout.strip()
+
+
+def app_installed(bundle_id):
+    r = subprocess.run(
+        ["/usr/bin/osascript", "-e",
+         'id of application id "%s"' % bundle_id],
+        capture_output=True, text=True)
+    return r.returncode == 0
+
+
+def app_running(proc_name):
+    return subprocess.run(["/usr/bin/pgrep", "-xq", proc_name]).returncode == 0
+
+
+def as_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def sh_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+class ITerm2:
+    """iTerm2: one tab per session in a single window."""
+    name = "iterm2"
+    bundle = "com.googlecode.iterm2"
+    proc = "iTerm2"
+    app = "iTerm2"
+
+    def window_count(self):
+        return int(osascript('tell application "iTerm2" to return count of windows') or 0)
+
+    def open(self, cmd, target):
+        if target == "initial":
+            body = 'tell current session of current window to write text %s' % as_str(cmd)
+        elif target == "window":
+            body = ('set w to (create window with default profile)\n'
+                    'tell current session of w to write text %s' % as_str(cmd))
+        else:
+            body = ('tell current window\n'
+                    '  set t to (create tab with default profile)\n'
+                    '  tell current session of t to write text %s\n'
+                    'end tell' % as_str(cmd))
+        osascript('tell application "iTerm2"\n%s\nend tell' % body)
+
+
+class TerminalApp:
+    """Apple Terminal: `do script` opens a new window per session. Tabs would
+    need Accessibility permission to send Cmd-T, which is not worth it."""
+    name = "terminal"
+    bundle = "com.apple.Terminal"
+    proc = "Terminal"
+    app = "Terminal"
+
+    def window_count(self):
+        return int(osascript('tell application "Terminal" to return count of windows') or 0)
+
+    def open(self, cmd, target):
+        if target == "initial":
+            # reuse the empty window Terminal opened when it launched
+            script = ('tell application "Terminal"\n'
+                      '  if (count of windows) > 0 then\n'
+                      '    do script %s in window 1\n'
+                      '  else\n'
+                      '    do script %s\n'
+                      '  end if\n'
+                      'end tell') % (as_str(cmd), as_str(cmd))
+        else:
+            script = 'tell application "Terminal" to do script %s' % as_str(cmd)
+        osascript(script)
+
+
+TERMINALS = {"iterm2": ITerm2, "terminal": TerminalApp}
+
+
+def pick_terminal(requested):
+    requested = requested or os.environ.get("CLAUDE_SESSIONS_TERMINAL", "")
+    if requested:
+        cls = TERMINALS.get(requested.lower())
+        if cls is None:
+            raise SystemExit("unknown terminal %r (choose: %s)"
+                             % (requested, ", ".join(sorted(TERMINALS))))
+        return cls()
+    # auto: prefer iTerm2 (tabs), then whatever is running, then Terminal
+    for cls in (ITerm2, TerminalApp):
+        if app_installed(cls.bundle):
+            return cls()
+    raise SystemExit("no supported terminal found (iTerm2 or Terminal.app)")
+
+
+# ----------------------------------------------------------------- commands
+
+def cmd_resume(args):
+    dry = "--dry-run" in args
+    at_login = "--at-login" in args
+    new_window = "--new-window" in args
+    term_arg = ""
+    if "--terminal" in args:
+        i = args.index("--terminal")
+        if i + 1 < len(args):
+            term_arg = args[i + 1]
+
+    if at_login:
+        # let the desktop, Wi-Fi and launchd finish waking up first
+        time.sleep(8)
+
+    live = live_sessions()
+    todo, skipped = [], []
+    for e in sorted(load_registry(), key=natural_key):
+        if e["session_id"] in live:
+            skipped.append((e, "already running (pid %s)" % live[e["session_id"]]["pid"]))
+            continue
+        ok, why = resumable(e)
+        if ok:
+            todo.append(e)
+        else:
+            skipped.append((e, why))
+
+    for e, why in skipped:
+        log("skip  %-24s %s" % (label(e), why))
+    if not todo:
+        log("nothing to resume")
+        return 0
+
+    log("resuming %d session(s)%s" % (len(todo), " (dry run)" if dry else ""))
+    if dry:
+        for e in todo:
+            print("  %-24s %s  claude --resume %s" % (label(e), e["cwd"], e["session_id"]))
+        return 0
+
+    term = pick_terminal(term_arg)
+    # When we are the ones launching the terminal, its initial empty window is
+    # ours to use rather than leave orphaned.
+    launched = not app_running(term.proc)
+    first_target = "window" if new_window else "tab"
+    tries = 6 if at_login else 2
+    for attempt in range(1, tries + 1):
+        try:
+            osascript('tell application "%s" to activate' % term.app, timeout=90)
+            n = term.window_count()
+            if launched and n == 0:
+                for _ in range(20):          # still opening its first window
+                    time.sleep(0.5)
+                    n = term.window_count()
+                    if n:
+                        break
+            if n == 0:
+                first_target = "window"
+            elif launched and not new_window:
+                first_target = "initial"
+            break
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            log("%s not ready (attempt %d/%d): %s" % (term.app, attempt, tries, exc))
+            if attempt == tries:
+                log("giving up; run `claude-sessions resume` by hand")
+                return 1
+            time.sleep(5)
+
+    failures = 0
+    for i, e in enumerate(todo):
+        cmd = "cd %s && claude --resume %s" % (sh_quote(e["cwd"]), e["session_id"])
+        try:
+            term.open(cmd, first_target if i == 0 else "tab")
+            log("open  %-24s %s  (%s)" % (label(e), e["cwd"], e["session_id"][:8]))
+        except (RuntimeError, subprocess.TimeoutExpired) as exc:
+            failures += 1
+            log("FAIL  %-24s %s" % (label(e), exc))
+        time.sleep(0.7)   # stagger so N Claude start-ups don't all hit the CPU
+
+    log("done: %d opened, %d failed" % (len(todo) - failures, failures))
+    return 1 if failures else 0
+
+
+def cmd_list(_args):
+    live = live_sessions()
+    entries = sorted(load_registry(), key=natural_key)
+    if not entries:
+        print("registry is empty  (%s)" % REG_DIR)
+        return 0
+    print("%-24s %-28s %-40s %s" % ("NAME", "STATUS", "DIRECTORY", "ID"))
+    for e in entries:
+        sid = e["session_id"]
+        if sid in live:
+            status = "running (pid %s)" % live[sid]["pid"]
+        elif e.get("ended_at"):
+            status = "closed %s @ %sZ" % (e.get("end_reason", "?"), e["ended_at"][11:16])
+        else:
+            ok, why = resumable(e)
+            status = "registered" if ok else "UNRESUMABLE: %s" % why
+        print("%-24s %-28s %-40s %s"
+              % (label(e), status, e.get("cwd", "").replace(str(HOME), "~"), sid[:8]))
+    return 0
+
+
+def cmd_snapshot(_args):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    existing = {e["session_id"]: e for e in load_registry()}
+    n = 0
+    for sid, d in live_sessions().items():
+        prev = existing.get(sid, {})
+        name = d.get("name", "") if d.get("nameSource") == "user" else prev.get("name", "")
+        # Claude's live entry has no transcript path; find it by session id
+        tp = prev.get("transcript_path") or ""
+        if not tp:
+            hits = glob.glob(str(HOME / ".claude" / "projects" / "*" / (sid + ".jsonl")))
+            tp = hits[0] if hits else ""
+        write_entry({
+            "session_id": sid,
+            "name": name or prev.get("name", ""),
+            "cwd": d.get("cwd", ""),
+            "transcript_path": tp,
+            "first_seen": prev.get("first_seen", now),
+            "last_seen": now,
+            "last_event": "snapshot",
+            "pid": d.get("pid"),
+        })
+        n += 1
+        print("registered  %-24s %s  (%s)" % (name or "(unnamed)", d.get("cwd", ""), sid[:8]))
+    print("%d live session(s) snapshotted" % n)
+    return 0
+
+
+def cmd_forget(args):
+    if not args:
+        print("usage: claude-sessions forget <name|id-prefix> ...", file=sys.stderr)
+        return 2
+    entries = load_registry()
+    removed = 0
+    for key in args:
+        for e in entries:
+            if e.get("name") == key or e["session_id"].startswith(key):
+                (REG_DIR / (e["session_id"] + ".json")).unlink(missing_ok=True)
+                print("forgot  %s  (%s)" % (label(e), e["session_id"][:8]))
+                removed += 1
+    if not removed:
+        print("no matching entries", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_prune(_args):
+    n = 0
+    for e in load_registry():
+        ok, why = resumable(e)
+        if not ok:
+            (REG_DIR / (e["session_id"] + ".json")).unlink(missing_ok=True)
+            print("pruned  %s  %s" % (label(e), why))
+            n += 1
+    print("%d entr%s pruned" % (n, "y" if n == 1 else "ies"))
+    return 0
+
+
+COMMANDS = {
+    "resume": cmd_resume,
+    "list": cmd_list,
+    "ls": cmd_list,
+    "snapshot": cmd_snapshot,
+    "forget": cmd_forget,
+    "prune": cmd_prune,
+}
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd = argv[0] if argv and not argv[0].startswith("-") else "resume"
+    rest = argv[1:] if argv and not argv[0].startswith("-") else argv
+    fn = COMMANDS.get(cmd)
+    if fn is None:
+        print("unknown command: %s\n\n%s" % (cmd, __doc__.strip()), file=sys.stderr)
+        return 2
+    return fn(rest)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
