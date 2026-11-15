@@ -262,6 +262,15 @@ def app_installed(bundle_id):
 
 
 def app_running(proc_name):
+    """Is the terminal app running? Ask macOS through AppleScript (`application X is running`
+    does not launch it). pgrep alone is not enough: from inside a sandboxed process (a Claude
+    Code session running restore) it can't see the app, and a false "not running" made resume
+    type its first command into the *current* tab instead of opening a new one."""
+    app = {"iTerm2": "iTerm2", "Terminal": "Terminal"}.get(proc_name, proc_name)
+    r = subprocess.run(["/usr/bin/osascript", "-e", 'application "%s" is running' % app],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        return r.stdout.strip() == "true"
     return subprocess.run(["/usr/bin/pgrep", "-xq", proc_name]).returncode == 0
 
 
@@ -424,7 +433,9 @@ def cmd_resume(args):
                         break
             if n == 0:
                 first_target = "window"
-            elif launched and not new_window:
+            elif launched and not new_window and not os.environ.get("TERM_PROGRAM"):
+                # only reuse the terminal's first window when we started the app ourselves
+                # (at login); run from inside a terminal, never type into the caller's tab
                 first_target = "initial"
             break
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
