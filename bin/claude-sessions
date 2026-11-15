@@ -20,6 +20,9 @@ Commands
              renames it on the phone: reconnects Remote Control under NEW (needs the
              session idle; --wait SECONDS), or switches it on if it was off
   tag X k=v  set a field on an entry (e.g. role=manager); k= clears it
+  add ID...  put sessions that are no longer registered (closed with /exit, or from before the
+             hooks) back in the registry, by session id or id prefix, so resume brings them back.
+             Name, start directory and Remote Control are read from the transcript.
   reconnect  after a login to another Claude account: give every running session that
              had Remote Control its link back under the current account, and (with
              --resume-stalled) tell sessions stopped by the usage limit to carry on
@@ -802,6 +805,52 @@ def cmd_reconnect(args):
     return 0
 
 
+def cmd_add(args):
+    keys = [a for a in args if not a.startswith("--")]
+    if not keys:
+        print("usage: claude-sessions add <session-id|prefix> ...", file=sys.stderr)
+        return 2
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    existing = {e["session_id"] for e in load_registry()}
+    n = 0
+    for key in keys:
+        hits = glob.glob(str(HOME / ".claude" / "projects" / "*" / (key + "*.jsonl")))
+        hits = [h for h in hits if "/subagents/" not in h]
+        if len(hits) != 1:
+            print("%s: %d transcripts match" % (key, len(hits)), file=sys.stderr)
+            continue
+        tp = hits[0]
+        sid = Path(tp).stem
+        if sid in existing:
+            print("%s: already registered" % sid[:8])
+            continue
+        name, rc, pm = "", False, None
+        with open(tp, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"custom-title"' in line or '"agent-name"' in line:
+                    try:
+                        d = json.loads(line)
+                        name = d.get("customTitle") or d.get("agentName") or name
+                    except ValueError:
+                        pass
+                elif '"bridge-session"' in line and '"bridgeSessionId":"cse' in line:
+                    rc = True
+                elif '"permission-mode"' in line:
+                    try:
+                        pm = json.loads(line).get("permissionMode") or pm
+                    except ValueError:
+                        pass
+        entry = {"session_id": sid, "name": name, "transcript_path": tp, "first_seen": now,
+                 "last_seen": now, "last_event": "add", "pid": None, "remote_control": rc,
+                 "permission_mode": pm}
+        entry["cwd"] = start_cwd(entry)
+        write_entry(entry)
+        n += 1
+        print("added  %-24s %s  (%s)%s" % (name or "(unnamed)", entry["cwd"], sid[:8],
+                                           "  +remote control" if rc else ""))
+    return 0 if n else 1
+
+
 COMMANDS = {
     "resume": cmd_resume,
     "list": cmd_list,
@@ -812,6 +861,7 @@ COMMANDS = {
     "rename": cmd_rename,
     "tag": cmd_tag,
     "reconnect": cmd_reconnect,
+    "add": cmd_add,
 }
 
 

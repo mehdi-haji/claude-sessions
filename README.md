@@ -103,6 +103,7 @@ new one registers itself.
 | `claude-sessions forget <name\|id>` | drop an entry so it does not come back |
 | `claude-sessions prune` | drop entries whose directory or transcript is gone |
 | `claude-sessions rename <name\|id> <new> [--rc] [--wait S]` | rename in the registry and in the live tab (types `/rename`); `--rc` also renames it on the phone (see below) |
+| `claude-sessions add <id> ...` | put a closed session (left with `/exit`, or from before the hooks) back in the registry, so `resume` brings it back |
 | `claude-sessions tag <name\|id> key=value` | set a field, e.g. `role=manager`; `key=` clears it |
 | `claude-sessions reconnect [--if-account-changed] [--resume-stalled] [--wait S]` | after logging in to another Claude account: Remote Control back on for every session that had it, and limit-stopped sessions told to resume |
 
