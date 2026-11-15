@@ -68,9 +68,20 @@ case "$cmd" in
       title=$(jq -r 'select(.nameSource == "user") | .name // empty' "$live" 2>/dev/null)
     fi
 
+    # Remote Control: Claude's live entry carries a bridgeSessionId while the
+    # session is reachable from claude.ai / the phone. Resume re-enables it.
+    # Sticky: an account switch or a network drop disconnects it for a while,
+    # and `claude-sessions reconnect` must still know the session wants it.
+    # Clear it on purpose with `claude-sessions tag <name> remote_control=`.
+    rc=""
+    if [ -f "$live" ]; then
+      rc=$(jq -r 'if .bridgeSessionId then "true" else "false" end' "$live" 2>/dev/null)
+    fi
+
     prev=$(jq -c . "$entry" 2>/dev/null) || prev='{}'
     printf '%s' "$prev" | jq -c \
       --arg sid "$sid" --arg name "$title" --arg now "$now" --arg pid "${CLAUDE_PID:-}" \
+      --arg rc "$rc" \
       --argjson in "$input" '
       {
         session_id: $sid,
@@ -80,8 +91,10 @@ case "$cmd" in
         first_seen: (.first_seen // $now),
         last_seen: $now,
         last_event: ([$in.hook_event_name, $in.source] | map(select(. != null)) | join(":")),
-        pid: (($pid | tonumber?) // null)
-      }' > "$entry.tmp.$$" 2>/dev/null && mv -f "$entry.tmp.$$" "$entry"
+        pid: (($pid | tonumber?) // null),
+        remote_control: (if $rc == "true" then true else (.remote_control // false) end),
+        permission_mode: ($in.permission_mode // .permission_mode // null)
+      } + (if .role then {role: .role} else {} end)' > "$entry.tmp.$$" 2>/dev/null && mv -f "$entry.tmp.$$" "$entry"
     rm -f "$entry.tmp.$$" 2>/dev/null
     ;;
 

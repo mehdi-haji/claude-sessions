@@ -14,6 +14,19 @@ Commands
   snapshot   seed the registry from the sessions running right now (for
              sessions that started before the hooks were installed)
   forget X   drop entries by name or session-id prefix
+  rename X NEW   rename a session (name or id prefix): the registry now, and a running
+             session in its own tab (types `/rename NEW`; a busy session runs it after its
+             current step; one showing a dialog is skipped unless --force) [--rc] also
+             renames it on the phone: reconnects Remote Control under NEW (needs the
+             session idle; --wait SECONDS), or switches it on if it was off
+  tag X k=v  set a field on an entry (e.g. role=manager); k= clears it
+  reconnect  after a login to another Claude account: give every running session that
+             had Remote Control its link back under the current account, and (with
+             --resume-stalled) tell sessions stopped by the usage limit to carry on
+             --if-account-changed   do nothing unless the account changed since last run
+             --wait SECONDS         wait that long for a connected-to-the-old-account
+                                    session to reach its prompt (it needs a dialog)
+             --dry-run              print what it would do
   prune      drop entries whose transcript or directory no longer exists
 
 Options for resume
@@ -21,6 +34,18 @@ Options for resume
   --at-login         wait for the desktop to settle and retry (LaunchAgent)
   --new-window       open in a new window instead of the current one
   --terminal NAME    iterm2 | terminal  (default: auto-detect)
+  --project DIR      only sessions of the project at DIR (its worktrees included)
+  --skip ID[,ID]     never open these (name or id prefix), e.g. the manager running the resume
+  --no-manager       skip entries tagged role=manager or role=vp
+  --skip-role R[,R]  skip entries tagged with these roles
+  --max-age DAYS     skip entries not seen for longer than this (listed, not opened)
+
+Each session comes back under its name (-n), with Remote Control if it had it
+(--remote-control <its Remote Control name>), and in its recorded permission mode.
+
+Options for list
+  --json             machine-readable (with "running", "project")
+  --project DIR      only that project's sessions
 
 Environment
   CLAUDE_RESUME_DIR  registry location (default ~/.claude/resume)
@@ -128,6 +153,91 @@ def log(msg):
             fh.write(line + "\n")
     except OSError:
         pass
+
+
+# ------------------------------------------------------------------ project
+
+def project_root(path):
+    """The main checkout a directory belongs to: git's common dir, so a linked
+    worktree (../X-wt/feat) maps to X. Not in git: the directory under
+    ~/projects (or the path itself)."""
+    if not path:
+        return ""
+    try:
+        r = subprocess.run(["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return str(Path(r.stdout.strip()).parent)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    p = Path(path)
+    proj = HOME / "projects"
+    try:
+        rel = p.relative_to(proj)
+        return str(proj / rel.parts[0]) if rel.parts else str(p)
+    except ValueError:
+        return str(p)
+
+
+def rc_name(entry):
+    """The Remote Control name the session last used: the args of its last
+    /remote-control command, else its own name."""
+    tp = entry.get("transcript_path") or ""
+    found = ""
+    try:
+        size = os.path.getsize(tp)
+        with open(tp, "rb") as fh:
+            fh.seek(max(0, size - (8 << 20)))
+            for line in fh:
+                if b'"remote-control"' in line and b'commandRun' in line:
+                    m = re.search(rb'"commandRun":\{"command":"remote-control","args":"([^"]*)"', line)
+                    if m:
+                        found = m.group(1).decode("utf-8", "replace")
+    except OSError:
+        pass
+    return found or entry.get("name") or ""
+
+
+def start_cwd(e):
+    """Where the session started: `--resume <id>` finds a transcript by the
+    project of the directory it runs in, and a session that later cd'd into
+    a subdirectory (libs/x, apps/y) would not be found from there."""
+    tp = e.get("transcript_path") or ""
+    try:
+        with open(tp, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                m = re.search(r'"cwd":"([^"]+)"', line)
+                if m and os.path.isdir(m.group(1)):
+                    return m.group(1)
+                if i > 400:
+                    break
+    except OSError:
+        pass
+    return e.get("cwd", "")
+
+
+def resume_command(e):
+    parts = ["claude", "--resume", e["session_id"]]
+    if e.get("name"):
+        parts += ["-n", sh_quote(e["name"])]
+    if e.get("remote_control"):
+        rn = rc_name(e)
+        parts += ["--remote-control"] + ([sh_quote(rn)] if rn else [])
+    if e.get("permission_mode"):
+        parts += ["--permission-mode", sh_quote(e["permission_mode"])]
+    return "cd %s && %s" % (sh_quote(start_cwd(e)), " ".join(parts))
+
+
+def opt(args, flag, default=""):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return default
+
+
+def matches(e, key):
+    return e.get("name") == key or e["session_id"].startswith(key)
 
 
 # ------------------------------------------------------------------ terminal
@@ -244,9 +354,34 @@ def cmd_resume(args):
         # let the desktop, Wi-Fi and launchd finish waking up first
         time.sleep(8)
 
+    proj = opt(args, "--project")
+    proj = project_root(os.path.abspath(os.path.expanduser(proj))) if proj else ""
+    skip = [k for k in opt(args, "--skip").split(",") if k]
+    skip_roles = {r for r in opt(args, "--skip-role").split(",") if r}
+    if "--no-manager" in args:
+        skip_roles |= {"manager", "vp"}
+    max_age = float(opt(args, "--max-age", "0") or 0)
+    now_utc = datetime.now(timezone.utc)
+
     live = live_sessions()
     todo, skipped = [], []
     for e in sorted(load_registry(), key=natural_key):
+        if proj and project_root(e.get("cwd", "")) != proj:
+            continue
+        if any(matches(e, k) for k in skip):
+            skipped.append((e, "skipped (--skip)"))
+            continue
+        if e.get("role") in skip_roles:
+            skipped.append((e, "role %s skipped" % e.get("role")))
+            continue
+        if max_age and e["session_id"] not in live:
+            try:
+                seen = datetime.strptime(e.get("last_seen", ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                if (now_utc - seen).days > max_age:
+                    skipped.append((e, "stale: last seen %s" % e["last_seen"][:10]))
+                    continue
+            except ValueError:
+                pass
         if e["session_id"] in live:
             skipped.append((e, "already running (pid %s)" % live[e["session_id"]]["pid"]))
             continue
@@ -265,7 +400,7 @@ def cmd_resume(args):
     log("resuming %d session(s)%s" % (len(todo), " (dry run)" if dry else ""))
     if dry:
         for e in todo:
-            print("  %-24s %s  claude --resume %s" % (label(e), e["cwd"], e["session_id"]))
+            print("  %-24s %s" % (label(e), resume_command(e)))
         return 0
 
     term = pick_terminal(term_arg)
@@ -298,10 +433,11 @@ def cmd_resume(args):
 
     failures = 0
     for i, e in enumerate(todo):
-        cmd = "cd %s && claude --resume %s" % (sh_quote(e["cwd"]), e["session_id"])
+        cmd = resume_command(e)
         try:
             term.open(cmd, first_target if i == 0 else "tab")
-            log("open  %-24s %s  (%s)" % (label(e), e["cwd"], e["session_id"][:8]))
+            log("open  %-24s %s  (%s)%s" % (label(e), e["cwd"], e["session_id"][:8],
+                                             "  +remote control" if e.get("remote_control") else ""))
         except (RuntimeError, subprocess.TimeoutExpired) as exc:
             failures += 1
             log("FAIL  %-24s %s" % (label(e), exc))
@@ -311,9 +447,24 @@ def cmd_resume(args):
     return 1 if failures else 0
 
 
-def cmd_list(_args):
+def cmd_list(args):
     live = live_sessions()
     entries = sorted(load_registry(), key=natural_key)
+    proj = opt(args, "--project")
+    proj = project_root(os.path.abspath(os.path.expanduser(proj))) if proj else ""
+    if proj:
+        entries = [e for e in entries if project_root(e.get("cwd", "")) == proj]
+    if "--json" in args:
+        out = []
+        for e in entries:
+            d = dict(e)
+            d["running"] = e["session_id"] in live
+            d["live_name"] = live.get(e["session_id"], {}).get("name") if d["running"] else None
+            d["live_status"] = live.get(e["session_id"], {}).get("status") if d["running"] else None
+            d["project"] = project_root(e.get("cwd", ""))
+            out.append(d)
+        print(json.dumps(out, indent=1))
+        return 0
     if not entries:
         print("registry is empty  (%s)" % REG_DIR)
         return 0
@@ -353,6 +504,9 @@ def cmd_snapshot(_args):
             "last_seen": now,
             "last_event": "snapshot",
             "pid": d.get("pid"),
+            "remote_control": bool(d.get("bridgeSessionId")) or prev.get("remote_control", False),
+            "permission_mode": prev.get("permission_mode"),
+            **({"role": prev["role"]} if prev.get("role") else {}),
         })
         n += 1
         print("registered  %-24s %s  (%s)" % (name or "(unnamed)", d.get("cwd", ""), sid[:8]))
@@ -390,6 +544,264 @@ def cmd_prune(_args):
     return 0
 
 
+def iterm_type(tty, text):
+    """Type a line into the iTerm2 session on this tty. True if found."""
+    script = ('tell application "iTerm2"\n'
+              '  repeat with w in windows\n    repeat with t in tabs of w\n'
+              '      repeat with s in sessions of t\n'
+              '        if tty of s is %s then\n'
+              '          tell s to write text %s\n          return "ok"\n'
+              '        end if\n      end repeat\n    end repeat\n  end repeat\n'
+              '  return "none"\nend tell') % (as_str("/dev/" + tty), as_str(text))
+    return osascript(script) == "ok"
+
+
+def iterm_do(tty, body):
+    script = ('tell application "iTerm2"\n  repeat with w in windows\n    repeat with t in tabs of w\n'
+              '      repeat with s in sessions of t\n        if tty of s is %s then\n%s\n        end if\n'
+              '      end repeat\n    end repeat\n  end repeat\n  return ""\nend tell') % (as_str("/dev/" + tty), body)
+    return osascript(script)
+
+
+def iterm_screen(tty, lines=14):
+    out = iterm_do(tty, "          return contents of s")
+    return "\n".join(out.rstrip().splitlines()[-lines:])
+
+
+def iterm_key(tty, expr):
+    iterm_do(tty, "          tell s to write text %s newline NO" % expr)
+
+
+def live_entry(sid):
+    return live_sessions().get(sid, {})
+
+
+def rc_reconnect(tty, sid, new):
+    """The phone keeps a Remote Control session's first name; /rename does not reach it
+    (verified 2026-11-15, Claude Code 2.1.325, iOS app). Disconnect and reconnect under the
+    new name: /remote-control opens Disconnect / Show QR code / Continue, the cursor on
+    Continue; Up twice, Enter disconnects; /remote-control NEW connects again (a new
+    Remote Control id: the phone lists the new name, with the conversation, and drops the old).
+    Checks the screen at each step and presses Esc (= Continue) if anything looks off."""
+    iterm_type(tty, "/remote-control")
+    for _ in range(10):
+        time.sleep(1)
+        sc = iterm_screen(tty)
+        if "Disconnect this session" in sc and "Esc to continue" in sc:
+            break
+    else:
+        return "no Remote Control dialog appeared"
+    for _ in range(2):
+        iterm_key(tty, '(ASCII character 27) & "[A"')
+        time.sleep(0.7)
+    line = [l for l in iterm_screen(tty).splitlines() if "Disconnect this session" in l]
+    if not line or "\u276f" not in line[0]:
+        iterm_key(tty, "(ASCII character 27)")
+        return "cursor not on Disconnect; pressed Esc, nothing changed"
+    iterm_key(tty, "return")
+    for _ in range(10):
+        time.sleep(1)
+        if not live_entry(sid).get("bridgeSessionId"):
+            break
+    else:
+        return "still connected after Disconnect"
+    iterm_type(tty, "/remote-control " + new)
+    for _ in range(20):
+        time.sleep(1)
+        if live_entry(sid).get("bridgeSessionId"):
+            return ""
+    return "reconnect did not show a Remote Control id within 20 s"
+
+
+def cmd_rename(args):
+    pos, skip_next = [], False
+    for a in args:
+        if skip_next:
+            skip_next = False
+        elif a == "--wait":
+            skip_next = True
+        elif not a.startswith("--"):
+            pos.append(a)
+    if len(pos) != 2:
+        print("usage: claude-sessions rename <name|id-prefix> <new-name> [--rc] [--wait SECONDS] [--force]",
+              file=sys.stderr)
+        return 2
+    key, new = pos
+    hits = [e for e in load_registry() if matches(e, key)]
+    live = live_sessions()
+    if not hits:   # a running session the registry has not seen yet
+        hits = [{"session_id": sid, "name": d.get("name", ""), "cwd": d.get("cwd", "")}
+                for sid, d in live.items() if d.get("name") == key or sid.startswith(key)]
+    if len(hits) != 1:
+        print("%d sessions match %r" % (len(hits), key), file=sys.stderr)
+        return 1
+    e = hits[0]
+    reg = REG_DIR / (e["session_id"] + ".json")
+    if reg.exists():
+        d = json.loads(reg.read_text()); d["name"] = new; write_entry(d)
+    if e["session_id"] in live:
+        d = live[e["session_id"]]
+        # A busy session queues typed input and runs it after the current step;
+        # a "waiting" one is showing a dialog (permission, question) that the
+        # typed line would answer instead. Never type into that. --rc on a connected
+        # session drives a dialog itself, so it needs the session idle (--wait N).
+        wait = float(opt(args, "--wait", "0") or 0)
+        need = "idle" if ("--rc" in args and d.get("bridgeSessionId")) else None
+        deadline = time.time() + wait
+        while True:
+            d = live_entry(e["session_id"]) or d
+            st = d.get("status")
+            # "shell" = at an empty prompt with a background task running: safe too
+            ok = (st in ("idle", "shell")) if need else (st != "waiting")
+            if ok or "--force" in args or time.time() >= deadline:
+                break
+            time.sleep(5)
+        if not ok and "--force" not in args:
+            print("renamed in the registry; %s is %s, so its tab was not typed into%s" % (
+                label(e), st, " (--rc on a connected session needs it at its prompt: idle or shell; use --wait SECONDS)" if need else ""))
+            return 3
+        tty = subprocess.run(["ps", "-o", "tty=", "-p", str(d["pid"])], capture_output=True,
+                             text=True).stdout.strip()
+        if not tty or tty in ("??", "-") or not iterm_type(tty, "/rename " + new):
+            print("renamed in the registry; could not find its iTerm2 tab: type /rename %s there" % new)
+            return 3
+        note = ""
+        if "--rc" in args:
+            time.sleep(2)
+            if d.get("bridgeSessionId"):
+                err = rc_reconnect(tty, e["session_id"], new)
+                note = ", Remote Control reconnected as %s" % new if not err else ", Remote Control NOT renamed: " + err
+            else:
+                iterm_type(tty, "/remote-control " + new)
+                note = ", Remote Control switched on"
+        print("renamed %s -> %s (registry and live session%s)" % (label(e), new, note))
+        return 0 if "NOT" not in note else 4
+    else:
+        print("renamed %s -> %s (registry; applied on resume)" % (label(e), new))
+    return 0
+
+
+def cmd_tag(args):
+    if len(args) < 2 or "=" not in args[1]:
+        print("usage: claude-sessions tag <name|id-prefix> key=value", file=sys.stderr)
+        return 2
+    k, v = args[1].split("=", 1)
+    n = 0
+    for e in load_registry():
+        if matches(e, args[0]):
+            if v:
+                e[k] = v
+            else:
+                e.pop(k, None)
+            write_entry(e); n += 1
+            print("tagged %s %s=%s" % (label(e), k, v))
+    return 0 if n else 1
+
+
+CLAUDE_JSON = HOME / ".claude.json"
+ACCOUNT_FILE = RESUME_DIR / "account.json"
+RESUME_NOTE = ("[automatic, after an account switch] The Claude account was switched to the other "
+               "subscription at %s, so the usage limit is lifted. Please resume where you left off.")
+
+
+def current_account():
+    """The signed-in account's id: ~/.claude.json oauthAccount (no secret involved)."""
+    try:
+        return (json.loads(CLAUDE_JSON.read_text()).get("oauthAccount") or {}).get("accountUuid") or ""
+    except (OSError, ValueError):
+        return ""
+
+
+def transcript_tail_state(tp):
+    """(owner account of the last Remote Control link, last turn ended on a 429) from the transcript tail."""
+    owner, stalled = "", False
+    try:
+        size = os.path.getsize(tp)
+        with open(tp, "rb") as fh:
+            fh.seek(max(0, size - (4 << 20)))
+            for raw in fh:
+                if b'"type":"bridge-session"' in raw:
+                    try:
+                        d = json.loads(raw)
+                        owner = d.get("ownerAccountUuid") or ("" if not d.get("bridgeSessionId") else owner)
+                    except ValueError:
+                        pass
+                elif b'"type":"assistant"' in raw and b'"isSidechain":false' in raw:
+                    stalled = b'"isApiErrorMessage":true' in raw and b'"apiErrorStatus":429' in raw
+                elif b'"type":"user"' in raw and b'"isSidechain":false' in raw and b'tool_result' not in raw:
+                    stalled = False
+    except OSError:
+        pass
+    return owner, stalled
+
+
+def cmd_reconnect(args):
+    dry = "--dry-run" in args
+    acct = current_account()
+    if not acct:
+        print("no signed-in account found in ~/.claude.json")
+        return 1
+    try:
+        prev = json.loads(ACCOUNT_FILE.read_text()).get("accountUuid", "")
+    except (OSError, ValueError):
+        prev = ""
+    if "--if-account-changed" in args and prev == acct:
+        return 0
+    if not dry:
+        RESUME_DIR.mkdir(parents=True, exist_ok=True)
+        ACCOUNT_FILE.write_text(json.dumps({"accountUuid": acct, "since": datetime.now(timezone.utc).isoformat()}))
+    switched = bool(prev) and prev != acct
+    log("account %s%s" % (acct[:8], " (switched from %s)" % prev[:8] if switched else ""))
+    if switched and not dry:
+        time.sleep(15)   # let the sessions notice the new login first
+    wait = float(opt(args, "--wait", "0") or 0)
+    reg = {e["session_id"]: e for e in load_registry()}
+    when = datetime.now().strftime("%H:%M")
+    later = []
+    for sid, d in sorted(live_sessions().items(), key=lambda kv: kv[1].get("name") or ""):
+        e = reg.get(sid, {})
+        name = d.get("name") if d.get("nameSource") == "user" else (e.get("name") or "")
+        tp = e.get("transcript_path") or ""
+        owner, stalled = transcript_tail_state(tp) if tp else ("", False)
+        wants_rc = e.get("remote_control") or bool(d.get("bridgeSessionId"))
+        tty = subprocess.run(["ps", "-o", "tty=", "-p", str(d["pid"])], capture_output=True, text=True).stdout.strip()
+        if not tty or tty in ("??", "-"):
+            continue
+        st = d.get("status")
+        if wants_rc and not d.get("bridgeSessionId"):
+            if st == "waiting":
+                log("skip  %-24s showing a dialog; run reconnect again later" % (name or sid[:8]))
+            else:
+                log("rc    %-24s switch Remote Control on" % (name or sid[:8]))
+                if not dry:
+                    iterm_type(tty, "/remote-control " + name if name else "/remote-control")
+        elif wants_rc and owner and owner != acct:
+            later.append((sid, name, tty))
+        if "--resume-stalled" in args and stalled and switched and st in ("idle", "shell"):
+            log("go    %-24s stopped on the usage limit: asking it to resume" % (name or sid[:8]))
+            if not dry:
+                time.sleep(2)
+                iterm_type(tty, RESUME_NOTE % when)
+    # connected, but under the old account: needs Disconnect + reconnect at its prompt
+    deadline = time.time() + wait
+    while later:
+        for item in list(later):
+            sid, name, tty = item
+            st = live_entry(sid).get("status")
+            if st in ("idle", "shell"):
+                log("rc    %-24s reconnect under the current account" % (name or sid[:8]))
+                err = "" if dry else rc_reconnect(tty, sid, name)
+                if err:
+                    log("FAIL  %-24s %s" % (name or sid[:8], err))
+                later.remove(item)
+        if not later or time.time() >= deadline:
+            break
+        time.sleep(10)
+    for sid, name, _ in later:
+        log("left  %-24s still on the old account's link (never reached its prompt)" % (name or sid[:8]))
+    return 0
+
+
 COMMANDS = {
     "resume": cmd_resume,
     "list": cmd_list,
@@ -397,6 +809,9 @@ COMMANDS = {
     "snapshot": cmd_snapshot,
     "forget": cmd_forget,
     "prune": cmd_prune,
+    "rename": cmd_rename,
+    "tag": cmd_tag,
+    "reconnect": cmd_reconnect,
 }
 
 

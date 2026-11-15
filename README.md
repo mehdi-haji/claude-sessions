@@ -102,10 +102,41 @@ new one registers itself.
 | `claude-sessions snapshot` | register the sessions running right now |
 | `claude-sessions forget <name\|id>` | drop an entry so it does not come back |
 | `claude-sessions prune` | drop entries whose directory or transcript is gone |
+| `claude-sessions rename <name\|id> <new> [--rc] [--wait S]` | rename in the registry and in the live tab (types `/rename`); `--rc` also renames it on the phone (see below) |
+| `claude-sessions tag <name\|id> key=value` | set a field, e.g. `role=manager`; `key=` clears it |
+| `claude-sessions reconnect [--if-account-changed] [--resume-stalled] [--wait S]` | after logging in to another Claude account: Remote Control back on for every session that had it, and limit-stopped sessions told to resume |
 
 `resume` flags: `--dry-run`, `--new-window`, `--terminal iterm2\|terminal`,
 and `--at-login` (what the launchd agent uses: waits for the desktop to settle
-and retries while the terminal is still starting up).
+and retries while the terminal is still starting up). `--project DIR` restricts it
+to one project (its worktrees included), `--skip a,b` and `--skip-role manager,vp`
+leave sessions out, and `--max-age DAYS` lists stale entries instead of opening them.
+A session comes back as
+`claude --resume <id> -n <name> [--remote-control <name>] [--permission-mode <mode>]`,
+run from the directory it **started** in (a resume from a later `cd` target would not
+find the transcript). The hook records Remote Control (sticky) and the permission mode.
+
+### Remote Control and the phone
+
+Typing into a session's tab is done through iTerm2 (matched by tty). A busy session runs
+the typed line after its current step; one whose status is `waiting` is showing a dialog
+and is never typed into.
+
+The Claude app keeps a Remote Control session's first name. Once a session's link has been
+re-created under a new id (an account switch, a resume after a reboot), Claude Code marks it
+`noHistoryBackfill` for good, and `/rename` no longer reaches the phone. `rename --rc`
+therefore disconnects and reconnects Remote Control under the new name, at the session's
+prompt (`--wait` for it). The phone then shows the new name, **with an empty chat**: the
+history stays in the session on the Mac.
+
+### Two Claude accounts
+
+Logging in to another account leaves running sessions working on the new one, but drops
+their Remote Control. `reconnect` puts it back, and `--resume-stalled` types a message marked
+as automatic into sessions whose last turn ended on a 429. The account id comes from
+`~/.claude.json` (`oauthAccount.accountUuid`, no secret read). The optional login agent
+`launchagent/com.claude-sessions.account-watch.plist.template` runs it within seconds of a
+login (install steps in the file).
 
 Resuming is always safe to run by hand — sessions that are already running are
 skipped, and tabs open in name order, so `SHE-T0 … SHE-T5`, `TF-T0 …` come back

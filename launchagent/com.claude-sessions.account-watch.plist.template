@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- After a login to another Claude account (written to ~/.claude.json), give every running
+     session its Remote Control back under the new account and tell sessions stopped by the
+     usage limit to resume. Fires on any change to ~/.claude.json and does nothing unless the
+     account changed. Log: ~/.claude/resume/account-watch.log
+     Install:
+       sed "s|__HOME__|$HOME|g" launchagent/com.claude-sessions.account-watch.plist.template \
+         > ~/Library/LaunchAgents/com.claude-sessions.account-watch.plist
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-sessions.account-watch.plist
+     Remove:
+       launchctl bootout gui/$(id -u)/com.claude-sessions.account-watch
+       rm ~/Library/LaunchAgents/com.claude-sessions.account-watch.plist -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.claude-sessions.account-watch</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/python3</string>
+    <string>__HOME__/.claude/bin/claude-sessions</string>
+    <string>reconnect</string><string>--if-account-changed</string>
+    <string>--resume-stalled</string><string>--wait</string><string>1800</string>
+  </array>
+  <key>WatchPaths</key><array><string>__HOME__/.claude.json</string></array>
+  <key>ThrottleInterval</key><integer>15</integer>
+  <key>StandardOutPath</key><string>__HOME__/.claude/resume/account-watch.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.claude/resume/account-watch.log</string>
+</dict></plist>
