@@ -39,6 +39,7 @@ Options for resume
   --terminal NAME    iterm2 | terminal  (default: auto-detect)
   --project DIR      only sessions of the project at DIR (its worktrees included)
   --skip ID[,ID]     never open these (name or id prefix), e.g. the manager running the resume
+  --only ID[,ID]     open only these (name or id prefix)
   --no-manager       skip entries tagged role=manager or role=vp
   --skip-role R[,R]  skip entries tagged with these roles
   --max-age DAYS     skip entries not seen for longer than this (listed, not opened)
@@ -369,6 +370,7 @@ def cmd_resume(args):
     proj = opt(args, "--project")
     proj = project_root(os.path.abspath(os.path.expanduser(proj))) if proj else ""
     skip = [k for k in opt(args, "--skip").split(",") if k]
+    only = [k for k in opt(args, "--only").split(",") if k]
     skip_roles = {r for r in opt(args, "--skip-role").split(",") if r}
     if "--no-manager" in args:
         skip_roles |= {"manager", "vp"}
@@ -379,6 +381,8 @@ def cmd_resume(args):
     todo, skipped = [], []
     for e in sorted(load_registry(), key=natural_key):
         if proj and project_root(e.get("cwd", "")) != proj:
+            continue
+        if only and not any(matches(e, k) for k in only):
             continue
         if any(matches(e, k) for k in skip):
             skipped.append((e, "skipped (--skip)"))
