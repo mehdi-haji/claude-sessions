@@ -205,7 +205,10 @@ def rc_name(entry):
 def start_cwd(e):
     """Where the session started: `--resume <id>` finds a transcript by the
     project of the directory it runs in, and a session that later cd'd into
-    a subdirectory (libs/x, apps/y) would not be found from there."""
+    a subdirectory (libs/x, apps/y) would not be found from there. A registry `start_dir`
+    overrides it (a project folder that was renamed and its transcript moved with it)."""
+    if e.get("start_dir") and os.path.isdir(e["start_dir"]):
+        return e["start_dir"]
     tp = e.get("transcript_path") or ""
     try:
         with open(tp, encoding="utf-8", errors="replace") as fh:
