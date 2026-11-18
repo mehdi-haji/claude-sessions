@@ -185,7 +185,9 @@ def project_root(path):
 
 def rc_name(entry):
     """The Remote Control name the session last used: the args of its last
-    /remote-control command, else its own name."""
+    /remote-control command, else its own name. A registry `rc_name` overrides both."""
+    if entry.get("rc_name"):
+        return entry["rc_name"]
     tp = entry.get("transcript_path") or ""
     found = ""
     try:
